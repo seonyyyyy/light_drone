@@ -1,0 +1,587 @@
+# -*- coding: utf-8 -*-
+"""
+멀티레인저 + Flow deck 장애물 회피 (실내 보강판)
+- 정책: DQN(이산 행동) Q[3] -> argmax -> {전진, 좌54°, 우54°}
+- 안전 레이어(최우선): 센서 안정화, HARD/SOFT, TTC, 가상범퍼, 코너/문틈, 측벽 푸시, 스테일/천장/바닥
+- 장시간 안정화: 회전 중 yaw 성형 우회, TTC 리셋, 턴 쿨다운
+- 전원 보호(개선): VBAT 임계 하향(현실적), EMA 적용, '지속시간' 조건 후 착륙
+"""
+
+import time
+import numpy as np
+from threading import Event, Lock
+import logging
+from collections import deque
+
+import cflib.crtp
+from cflib.crazyflie import Crazyflie
+from cflib.crazyflie.syncCrazyflie import SyncCrazyflie
+from cflib.crazyflie.log import LogConfig
+from cflib.crazyflie.syncLogger import SyncLogger
+
+logging.getLogger('cflib.crazyflie.log').setLevel(logging.ERROR)
+
+# ====== 라디오 주소(수정) ======
+URI = 'radio://0/80/2M/E7E7E7E7E7'
+
+# ====== 기본 비행/안전 ======
+TAKEOFF_Z = 0.25
+RUN_TIME   = 45
+MAX_V      = 0.16
+MAX_YAW    = 160.0
+HARD_STOP  = 0.30
+SOFT_STOP  = 0.55
+
+# ====== 디버그 ======
+VERBOSE_RANGES = True
+VERBOSE_PERIOD = 0.25
+
+# ====== 모델 ======
+USE_ONNX   = True
+USE_TFLITE = False
+ONNX_PATH   = r"C:\Users\pgr05\OneDrive\바탕 화면\모델\모델\model.onnx"
+TFLITE_PATH = r"C:\Users\pgr05\OneDrive\바탕 화면\모델\모델\model.tflite"
+
+# (연속제어 스케일은 미사용. DQN은 Q->행동 선택)
+MODEL_V_SCALE   = 0.11
+MODEL_YAW_SCALE = 40.0
+
+# ====== 출력 성형 ======
+EMA_ALPHA   = 0.35
+SLEW_V      = 0.26
+SLEW_YAW    = 400.0
+DEADZONE_V  = 0.015
+DEADZONE_YW = 1.5
+
+# ====== 안정화/안전 추가 파라미터 ======
+SOFT_SLOW    = 0.90
+SOFT_BAND    = 0.45
+HYSTERESIS   = 0.05
+SIDE_STEP_V  = 0.18
+BACK_OFF_V   = 0.18
+UNSTICK_YAW  = 25.0
+STALE_TMO    = 0.6
+WINDOW_N     = 6
+EMA_R_ALPHA  = 0.45
+
+# 천장/바닥
+CEIL_SOFT    = 0.40
+FLOOR_SOFT   = 0.25
+
+# === 가상 범퍼/코너/측벽/급제동 ===
+BUMP_MARGIN   = 0.08
+CORNER_TH     = 0.42
+DOORWAY_SPAN  = 0.65
+WALL_PUSH_K   = 0.35
+WALL_PUSH_MAX = 0.12
+# TTC 급제동
+TTC_HARD      = 0.6
+TTC_SOFT      = 1.0
+DERIV_WIN_S   = 0.30
+
+# ====== DQN 이산 행동 매핑 ======
+ACTIONS = ('FWD', 'TURN_L', 'TURN_R')
+V_FWD = 0.14
+TURN_ANGLE_DEG = 54.0
+YAW_TURN_RATE  = 120.0            # deg/s
+TURN_DUR = TURN_ANGLE_DEG / YAW_TURN_RATE  # ≈ 0.45 s
+ACTION_HOLD_MIN = 0.20
+TURN_COOLDOWN   = 0.25
+
+# ====== 배터리 보호 & 워밍업(조정버전) ======
+# - Crazyflie 1S는 비행 중 순간적으로 3.1~3.2V까지 내려갈 수 있음
+# - 하드컷을 3.05V로 낮추고, 1.2초 지속 시에만 착륙. 소프트는 3.25V
+VBAT_SOFT = 3.25        # 부드러운 감속 시작
+VBAT_HARD = 3.05        # 즉시 착륙 임계 (지속시간 충족 필요)
+VBAT_HARD_HOLD_S = 1.2  # 이 시간 연속으로 임계 미만이면 착륙
+WARMUP_S = 2.0          # 이륙 후 워밍업 시간: 배터리 컷 비적용
+VBAT_MIN_V = 2.5        # 유효성 가드
+VBAT_MAX_V = 5.5
+VBAT_EMA_ALPHA = 0.5    # vbat EMA
+STABILIZE_AFTER_TAKEOFF_S = 0.8  # 이륙 직후 제자리 안정화
+
+# ----- ONNX / TFLite -----
+ort_sess = None
+onnx_input, onnx_output = None, None
+tflite_interpreter = None
+tfl_in_idx = None
+tfl_out_idx = None
+
+def init_onnx(path=ONNX_PATH):
+    global ort_sess, onnx_input, onnx_output
+    import onnxruntime as ort
+    ort_sess = ort.InferenceSession(path, providers=['CPUExecutionProvider'])
+    onnx_input  = ort_sess.get_inputs()[0].name
+    onnx_output = ort_sess.get_outputs()[0].name
+    print(f"[ONNX] loaded: {path}\n[ONNX] in={onnx_input} out={onnx_output}")
+
+def infer_onnx(x):
+    out = ort_sess.run([onnx_output], {onnx_input: x.reshape(1,-1).astype(np.float32)})[0].reshape(-1)
+    out = np.array(out, dtype=float)
+    if out.size < 3:
+        out = np.pad(out, (0, 3-out.size), 'edge')
+    return float(out[0]), float(out[1]), float(out[2])
+
+def init_tflite(path=TFLITE_PATH):
+    global tflite_interpreter, tfl_in_idx, tfl_out_idx
+    try:
+        import tflite_runtime.interpreter as tflite
+    except ImportError:
+        import tensorflow as tf
+        tflite = tf.lite
+    tflite_interpreter = tflite.Interpreter(model_path=path)
+    tflite_interpreter.allocate_tensors()
+    tfl_in_idx  = tflite_interpreter.get_input_details()[0]['index']
+    tfl_out_idx = tflite_interpreter.get_output_details()[0]['index']
+    print(f"[TFLite] loaded: {path}")
+
+def infer_tflite(x):
+    tflite_interpreter.set_tensor(tfl_in_idx, x.reshape(1,-1).astype(np.float32))
+    tflite_interpreter.invoke()
+    out = tflite_interpreter.get_tensor(tfl_out_idx).reshape(-1)
+    out = np.array(out, dtype=float)
+    if out.size < 3:
+        out = np.pad(out, (0, 3-out.size), 'edge')
+    return float(out[0]), float(out[1]), float(out[2])
+
+# ====== 유틸 ======
+def clamp(v, lo, hi): return max(lo, min(hi, v))
+def clamp_cmd(vx, vy, yaw):
+    return (clamp(vx, -MAX_V, MAX_V),
+            clamp(vy, -MAX_V, MAX_V),
+            clamp(yaw, -MAX_YAW, MAX_YAW))
+
+def ensure_param_equals(cf, fullname, expect=1, timeout=6.0, poll=0.2):
+    t0 = time.time(); expect = str(int(expect))
+    while time.time()-t0 < timeout:
+        try:
+            if str(cf.param.get_value(fullname)) == expect:
+                return True
+        except KeyError:
+            pass
+        time.sleep(poll)
+    return False
+
+def _to_meters(raw_mm):
+    if raw_mm is None: return np.nan
+    try: v = int(raw_mm)
+    except Exception: return np.nan
+    if v <= 0 or v >= 32000: return np.nan
+    return v/1000.0
+
+def preprocess(ranges_m):
+    x = ranges_m.copy()
+    x = np.where(np.isnan(x), 0.5, x)
+    x = np.clip(x, 0.05, 4.0)
+    x = (x - 0.5)/3.5
+    return x
+
+def dz(v, th): return 0.0 if abs(v) < th else v
+def slew(curr, prev, rate, dt):
+    max_step = rate*dt
+    d = curr - prev
+    if d >  max_step: d =  max_step
+    if d < -max_step: d = -max_step
+    return prev + d
+
+# ====== 공유 상태 ======
+_latest_ranges = np.array([np.nan]*6, dtype=float)  # [f,b,l,r,u,d]
+_sample_event = Event()
+_lock = Lock()
+_has_down_sensor = False
+
+# 배터리 원시/EMA
+_vbat = 0.0
+_vbat_ema = None
+
+# 센서 안정화 버퍼/상태 + 거리 이력(TTC용)
+_range_buf = {k: deque(maxlen=WINDOW_N) for k in ['f','b','l','r','u','d']}
+_range_ema = {k: np.nan for k in ['f','b','l','r','u','d']}
+_last_sample_ts = 0.0
+_hist = {k: deque() for k in ['f','b','l','r']}
+
+def _on_ranges(ts, data, logconf):
+    global _last_sample_ts, _vbat, _vbat_ema
+    f = _to_meters(data.get('range.front'))
+    b = _to_meters(data.get('range.back'))
+    l = _to_meters(data.get('range.left'))
+    r = _to_meters(data.get('range.right'))
+    u = _to_meters(data.get('range.up'))
+    d = _to_meters(data.get('range.zrange')) if _has_down_sensor else np.nan
+    try:
+        v = float(data.get('pm.vbat'))
+        _vbat = v
+        if VBAT_MIN_V <= v <= VBAT_MAX_V:
+            if _vbat_ema is None:
+                _vbat_ema = v
+            else:
+                _vbat_ema = VBAT_EMA_ALPHA*v + (1-VBAT_EMA_ALPHA)*_vbat_ema
+    except:
+        pass
+
+    def _push(key, val):
+        if not np.isnan(val):
+            _range_buf[key].append(val)
+            prev = _range_ema[key]
+            _range_ema[key] = val if np.isnan(prev) else (EMA_R_ALPHA*val + (1-EMA_R_ALPHA)*prev)
+
+    for k,vv in [('f',f),('b',b),('l',l),('r',r),('u',u),('d',d)]:
+        _push(k,vv)
+
+    def _blend(key):
+        med = np.median(_range_buf[key]) if len(_range_buf[key])>0 else np.nan
+        ema = _range_ema[key]
+        if np.isnan(med) and np.isnan(ema): return np.nan
+        if np.isnan(med): return ema
+        if np.isnan(ema): return med
+        return 0.6*med + 0.4*ema
+
+    with _lock:
+        _latest_ranges[:] = [_blend('f'), _blend('b'), _blend('l'),
+                             _blend('r'), _blend('u'), _blend('d')]
+    _last_sample_ts = time.time()
+    _sample_event.set()  # 첫 샘플 수신 알림
+
+    # TTC용 이력
+    for key, val in [('f',f),('b',b),('l',l),('r',r)]:
+        if not np.isnan(val):
+            _hist[key].append((_last_sample_ts, val))
+            while len(_hist[key])>0 and _last_sample_ts - _hist[key][0][0] > max(DERIV_WIN_S, 1.2*VERBOSE_PERIOD):
+                _hist[key].popleft()
+
+def start_persistent_logger(cf, has_down):
+    lg = LogConfig(name='Ranges', period_in_ms=50)
+    for n in ['range.front','range.back','range.left','range.right','range.up']:
+        lg.add_variable(n, 'uint16_t')
+    if has_down:
+        lg.add_variable('range.zrange', 'uint16_t')
+    try:
+        lg.add_variable('pm.vbat', 'float')
+    except Exception:
+        pass
+
+    for _ in range(8):
+        try:
+            cf.log.add_config(lg)
+            lg.data_received_cb.add_callback(_on_ranges)
+            lg.start()
+            break
+        except KeyError:
+            time.sleep(0.2)
+    else:
+        raise RuntimeError("로그 TOC 준비 실패")
+    _sample_event.clear()
+    _sample_event.wait(timeout=2.0)
+    return lg
+
+def read_ranges_once(cf, has_down, tries=12):
+    log = LogConfig(name='Prime', period_in_ms=50)
+    for n in ['range.front','range.back','range.left','range.right','range.up']:
+        log.add_variable(n, 'uint16_t')
+    if has_down:
+        log.add_variable('range.zrange','uint16_t')
+    for _ in range(tries):
+        try:
+            with SyncLogger(cf, log) as logger:
+                for _, ds, _ in logger:
+                    f = _to_meters(ds.get('range.front'))
+                    b = _to_meters(ds.get('range.back'))
+                    l = _to_meters(ds.get('range.left'))
+                    r = _to_meters(ds.get('range.right'))
+                    u = _to_meters(ds.get('range.up'))
+                    d = _to_meters(ds.get('range.zrange')) if has_down else np.nan
+                    return np.array([f,b,l,r,u,d], dtype=float)
+        except KeyError:
+            time.sleep(0.2)
+    return np.array([np.nan]*6, dtype=float)
+
+# --- 파생 지표 ---
+def _inflate(dist):
+    if np.isnan(dist): return np.nan
+    return max(0.0, dist - BUMP_MARGIN)
+
+def _ttc(key):
+    h = list(_hist[key])
+    if len(h) < 2: return np.inf
+    t = np.array([p[0] for p in h], dtype=float)
+    d = np.array([p[1] for p in h], dtype=float)
+    t = t - t[0]
+    A = np.vstack([t, np.ones_like(t)]).T
+    slope, _ = np.linalg.lstsq(A, d, rcond=None)[0]
+    d_now = d[-1]
+    d_dot = slope
+    if d_dot >= 0:
+        return np.inf
+    return d_now / (-d_dot) if d_now>0 else 0.0
+
+def _wall_push(l, r):
+    if np.isnan(l) or np.isnan(r): return 0.0
+    diff = (r - l)
+    mag = WALL_PUSH_K * (1.0 / max(0.05, min(l, r)))
+    push = clamp(diff * mag, -WALL_PUSH_MAX, WALL_PUSH_MAX)
+    return push
+
+# ---- 안전 회피/감속 ----
+def _safety_avoid(r):
+    f, b, l, rr, u, d = r.tolist()
+
+    # 스테일 보호
+    if time.time() - _last_sample_ts > STALE_TMO:
+        return (1.0, 1.0, 0.0, True, (0.0, 0.0, 0.0))
+
+    # 가상 범퍼
+    f2 = _inflate(f); b2 = _inflate(b); l2 = _inflate(l); r2 = _inflate(rr)
+
+    # 코너/문틈
+    is_corner_f_l = (not np.isnan(f2) and not np.isnan(l2) and min(f2, l2) < CORNER_TH)
+    is_corner_f_r = (not np.isnan(f2) and not np.isnan(r2) and min(f2, r2) < CORNER_TH)
+    tight_passage  = (not np.isnan(l2) and not np.isnan(r2) and (l2 + r2) < DOORWAY_SPAN)
+
+    # TTC
+    ttc_f = _ttc('f'); ttc_b = _ttc('b'); ttc_l = _ttc('l'); ttc_r = _ttc('r')
+
+    # HARD: 최근접
+    dmap = {'front': f2, 'back': b2, 'left': l2, 'right': r2}
+    nearest_dir = min(dmap, key=lambda k: (dmap[k] if not np.isnan(dmap[k]) else 999))
+    nearest = dmap[nearest_dir]
+    hard_th = HARD_STOP + HYSTERESIS
+
+    # TTC 하드 트리거
+    if ttc_f < TTC_HARD or ttc_l < TTC_HARD or ttc_r < TTC_HARD or (not np.isnan(nearest) and nearest < hard_th):
+        # 코너면 대각선
+        if is_corner_f_l or is_corner_f_r:
+            if (is_corner_f_l and (not is_corner_f_r)) or (l2 < r2):
+                return (1.0,1.0,0.0, True, (-BACK_OFF_V, -SIDE_STEP_V,  UNSTICK_YAW))
+            else:
+                return (1.0,1.0,0.0, True, (-BACK_OFF_V,  SIDE_STEP_V, -UNSTICK_YAW))
+        # 일반 하드
+        if nearest_dir in ('front','back'):
+            vy = SIDE_STEP_V if (l2 if not np.isnan(l2) else 0.0) > (r2 if not np.isnan(r2) else 0.0) else -SIDE_STEP_V
+            vx = -BACK_OFF_V if nearest_dir=='front' else BACK_OFF_V
+            yaw = UNSTICK_YAW * (1 if vy>0 else -1)
+            return (1.0,1.0,0.0, True, (vx, vy, yaw))
+        else:
+            vx = BACK_OFF_V if (b2 if not np.isnan(b2) else 0.0) > (f2 if not np.isnan(f2) else 0.0) else -BACK_OFF_V
+            vy = -SIDE_STEP_V if nearest_dir=='left' else SIDE_STEP_V
+            yaw = UNSTICK_YAW * (1 if vx>0 else -1)
+            return (1.0,1.0,0.0, True, (vx, vy, yaw))
+
+    # SOFT 감속
+    def slow_factor(dist, ttc):
+        s1 = 1.0
+        if not np.isnan(dist):
+            if dist >= SOFT_BAND: s1 = 1.0
+            else:
+                lo = HARD_STOP + HYSTERESIS
+                hi = SOFT_BAND
+                s1 = (1.0 - SOFT_SLOW) if dist <= lo else ((1.0 - SOFT_SLOW) + SOFT_SLOW * ((dist - lo)/(hi - lo)))
+        s2 = 1.0
+        if ttc < np.inf:
+            if ttc <= TTC_HARD: s2 = 0.25
+            elif ttc <= TTC_SOFT: s2 = 0.6
+        return min(s1, s2)
+
+    vx_mul = min(slow_factor(f2, ttc_f), slow_factor(b2, ttc_b))
+    vy_mul = min(slow_factor(l2, ttc_l), slow_factor(r2, ttc_r))
+
+    # 측벽 푸시
+    yaw_add = 0.0
+    wall_push = _wall_push(l2, r2)
+    if abs(wall_push) > 1e-3 and tight_passage:
+        yaw_add = UNSTICK_YAW * np.sign(wall_push) * 0.6
+
+    return (vx_mul, vy_mul, yaw_add, False, None), wall_push
+
+def main():
+    global _has_down_sensor, _vbat, _vbat_ema
+
+    cflib.crtp.init_drivers()
+    if USE_ONNX:   init_onnx(ONNX_PATH)
+    if USE_TFLITE: init_tflite(TFLITE_PATH)
+
+    with SyncCrazyflie(URI, cf=Crazyflie(rw_cache='./cache')) as scf:
+        cf = scf.cf
+        time.sleep(0.6)
+        cf.param.set_value('commander.enHighLevel', '1')
+        cf.param.set_value('stabilizer.estimator', '2')
+
+        # Flow/Flow2도 하향 센서로 인정
+        has_zranger2 = ensure_param_equals(cf, 'deck.bcZRanger2', 1, timeout=0.2)
+        has_zranger  = ensure_param_equals(cf, 'deck.bcZRanger',  1, timeout=0.2)
+        has_flow2    = ensure_param_equals(cf, 'deck.bcFlow2',    1, timeout=0.2)
+        has_flow     = ensure_param_equals(cf, 'deck.bcFlow',     1, timeout=0.2)
+        _has_down_sensor = bool(has_zranger2 or has_zranger or has_flow2 or has_flow)
+
+        if not ensure_param_equals(cf, 'deck.bcMultiranger', 1, timeout=6.0):
+            cur = 'N/A'
+            try: cur = cf.param.get_value('deck.bcMultiranger')
+            except: pass
+            print(f"Multi-ranger deck not detected (deck.bcMultiranger={cur})")
+            for k in ['deck.bcZRanger2','deck.bcZRanger','deck.bcFlow2','deck.bcFlow']:
+                try: print(k, cf.param.get_value(k))
+                except: pass
+            return
+
+        _ = read_ranges_once(cf, _has_down_sensor, tries=12)
+        lg = start_persistent_logger(cf, _has_down_sensor)
+
+        cf.high_level_commander.takeoff(TAKEOFF_Z, 1.6)
+        time.sleep(1.7)
+
+        prev_cmd = np.array([0.0, 0.0, 0.0], dtype=float)
+        last_t = time.time()
+        last_print = 0.0
+
+        # DQN 액션 유지 상태
+        policy_state = {'mode': None, 'until': 0.0, 'last_switch': 0.0}
+
+        # 저전압 지속시간 체크
+        low_hard_since = None
+
+        try:
+            t0 = time.time()
+            while time.time() - t0 < RUN_TIME:
+                now = time.time()
+                dt = max(1e-3, now - last_t)
+                last_t = now
+                flight_t = now - t0
+
+                with _lock:
+                    ranges = _latest_ranges.copy()
+                if np.isnan(ranges[5]): ranges[5] = TAKEOFF_Z
+
+                # 표시할 VBAT(EMA 우선)
+                vbat_disp = _vbat_ema if _vbat_ema is not None else _vbat
+
+                if VERBOSE_RANGES and (time.time()-last_print)>=VERBOSE_PERIOD:
+                    f,b,l,r,u,d = ranges.tolist()
+                    def p(v): return "nan" if np.isnan(v) else f"{v:.2f}"
+                    print(f"R[m] F:{p(f)} B:{p(b)} L:{p(l)} R:{p(r)} U:{p(u)} D:{p(d)} | VBAT:{vbat_disp:.2f}V")
+                    last_print = time.time()
+
+                # 배터리 유효성 가드 & 소프트 제한(워밍업 제외)
+                vbat = vbat_disp
+                vbat_ok = (VBAT_MIN_V <= vbat <= VBAT_MAX_V)
+                if vbat_ok and flight_t > WARMUP_S and vbat < VBAT_SOFT:
+                    MAX_V_SOFT = 0.10
+                else:
+                    MAX_V_SOFT = MAX_V
+
+                safe = _safety_avoid(ranges)
+                if isinstance(safe[0], tuple) and len(safe)==2:
+                    (vx_mul, vy_mul, yaw_add, handled, hard_cmd), wall_push = safe
+                else:
+                    vx_mul, vy_mul, yaw_add, handled, hard_cmd = safe
+                    wall_push = 0.0
+
+                if handled and hard_cmd is not None:
+                    vx, vy, yaw = hard_cmd
+                    for k in ['f','b','l','r']:
+                        _hist[k].clear()
+                else:
+                    # ===== DQN 정책 =====
+                    x = preprocess(ranges)
+                    if USE_ONNX:
+                        q0, q1, q2 = infer_onnx(x)
+                    elif USE_TFLITE:
+                        q0, q1, q2 = infer_tflite(x)
+                    else:
+                        q0, q1, q2 = 1.0, 0.0, 0.0
+
+                    q = np.array([q0, q1, q2], dtype=float)
+                    act_idx = int(np.argmax(q))
+                    act = ACTIONS[act_idx]
+
+                    ready_to_switch = (now >= policy_state['until']) and (now - policy_state['last_switch'] >= max(ACTION_HOLD_MIN, TURN_COOLDOWN))
+                    if ready_to_switch:
+                        if act == 'FWD':
+                            policy_state['mode'] = 'FWD'
+                            policy_state['until'] = now + 0.0
+                            policy_state['last_switch'] = now
+                        elif act == 'TURN_L':
+                            policy_state['mode'] = 'TURN_L'
+                            policy_state['until'] = now + TURN_DUR
+                            policy_state['last_switch'] = now
+                        else:
+                            policy_state['mode'] = 'TURN_R'
+                            policy_state['until'] = now + TURN_DUR
+                            policy_state['last_switch'] = now
+
+                    if policy_state['mode'] == 'FWD':
+                        vx, vy, yaw = V_FWD, 0.0, 0.0
+                    elif policy_state['mode'] == 'TURN_L':
+                        vx, vy, yaw = 0.0, 0.0, +YAW_TURN_RATE
+                    elif policy_state['mode'] == 'TURN_R':
+                        vx, vy, yaw = 0.0, 0.0, -YAW_TURN_RATE
+                    else:
+                        vx, vy, yaw = 0.0, 0.0, 0.0
+
+                    vx *= vx_mul
+                    vy *= vy_mul
+                    vy += wall_push
+                    yaw += yaw_add
+
+                # 이륙 직후 안정화
+                if flight_t < STABILIZE_AFTER_TAKEOFF_S:
+                    vx, vy, yaw = 0.0, 0.0, 0.0
+
+                # 성형
+                turning_now = (policy_state['mode'] in ('TURN_L', 'TURN_R'))
+
+                def clamp_cmd_soft(vx, vy, yaw):
+                    return (clamp(vx, -MAX_V_SOFT, MAX_V_SOFT),
+                            clamp(vy, -MAX_V_SOFT, MAX_V_SOFT),
+                            clamp(yaw, -MAX_YAW, MAX_YAW))
+
+                vx, vy, yaw = clamp_cmd_soft(vx, vy, yaw)
+                vx = dz(vx, DEADZONE_V);  vy = dz(vy, DEADZONE_V)
+
+                if turning_now and flight_t >= STABILIZE_AFTER_TAKEOFF_S:
+                    yaw = dz(yaw, DEADZONE_YW)
+                else:
+                    yaw = dz(yaw, DEADZONE_YW)
+                    yaw = EMA_ALPHA*yaw + (1-EMA_ALPHA)*prev_cmd[2]
+                    yaw = slew(yaw, prev_cmd[2], SLEW_YAW, dt)
+
+                vx = EMA_ALPHA*vx + (1-EMA_ALPHA)*prev_cmd[0]
+                vy = EMA_ALPHA*vy + (1-EMA_ALPHA)*prev_cmd[1]
+                vx = slew(vx,  prev_cmd[0], SLEW_V,   dt)
+                vy = slew(vy,  prev_cmd[1], SLEW_V,   dt)
+                vx, vy, yaw = clamp_cmd_soft(vx, vy, yaw)
+
+                # 저전압 하드 컷: 유효 + 워밍업 종료 + (임계 미만 지속)
+                if vbat_ok and flight_t > WARMUP_S:
+                    if vbat < VBAT_HARD:
+                        if low_hard_since is None:
+                            low_hard_since = now
+                        elif (now - low_hard_since) >= VBAT_HARD_HOLD_S:
+                            print(f"[POWER] LOW VBAT hard-cut: {vbat:.2f}V for {now-low_hard_since:.2f}s -> landing")
+                            cf.commander.send_hover_setpoint(0,0,0,TAKEOFF_Z)
+                            time.sleep(0.3)
+                            cf.high_level_commander.land(0.0, 1.5)
+                            return
+                    else:
+                        low_hard_since = None  # 회복
+
+                cf.commander.send_hover_setpoint(vx, vy, yaw, TAKEOFF_Z)
+                prev_cmd[:] = [vx, vy, yaw]
+                time.sleep(0.05)
+
+        except KeyboardInterrupt:
+            pass
+        finally:
+            try:
+                cf.commander.send_hover_setpoint(0,0,0,TAKEOFF_Z)
+                time.sleep(0.5)
+                cf.high_level_commander.land(0.0, 1.3)
+                time.sleep(1.4)
+                cf.high_level_commander.stop()
+            finally:
+                try:
+                    lg.stop()
+                    cf.log.delete_config(lg)
+                except Exception:
+                    pass
+
+if __name__ == '__main__':
+    main()
